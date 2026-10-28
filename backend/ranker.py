@@ -1,46 +1,12 @@
-"""
-ranker.py
-Core scoring engine: sentence embeddings + cosine similarity, plus
-keyword-based skill extraction for explainability.
+"""Lightweight resume ranking engine for low-memory hosting.
 
-Render-friendly version:
-- Uses a smaller sentence-transformer model
-- CPU-only inference
-- No gradient tracking
-- No sklearn runtime import
-- Smaller max sequence length
+Uses token-based cosine similarity plus explicit skill matching. This avoids
+loading PyTorch/Sentence Transformers into the web-service process, which can
+exceed the RAM limit on small free hosting instances.
 """
-
-import os
+from collections import Counter
+import math
 import re
-from functools import lru_cache
-
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-import torch
-from sentence_transformers import SentenceTransformer
-
-
-MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L3-v2"
-
-torch.set_num_threads(1)
-
-_model = None
-
-
-def get_model():
-    global _model
-
-    if _model is None:
-        _model = SentenceTransformer(
-            MODEL_NAME,
-            device="cpu",
-        )
-        _model.max_seq_length = 256
-        _model.eval()
-
-    return _model
-
 
 COMMON_SKILLS = [
     "python", "java", "javascript", "typescript", "c++", "c#", "sql", "nosql",
@@ -54,47 +20,45 @@ COMMON_SKILLS = [
 ]
 
 
+_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "has", "have", "in", "is", "it", "of", "on", "or", "our", "that",
+    "the", "their", "this", "to", "was", "were", "will", "with", "you",
+    "your", "we", "they", "he", "she", "i", "me", "my", "not", "but",
+}
+
+
+def _tokens(text: str) -> list[str]:
+    """Normalize text into useful word tokens without external ML libraries."""
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9+#.\-]*", (text or "").lower())
+    return [w.strip(".-") for w in words if len(w.strip(".-")) > 1 and w not in _STOP_WORDS]
+
+
+def _embed(text: str) -> Counter:
+    return Counter(_tokens(text))
+
+
+def _cosine_similarity(text_a: str, text_b: str) -> float:
+    """Cosine similarity over token counts; returns a value from 0 to 1."""
+    a, b = _embed(text_a), _embed(text_b)
+    if not a or not b:
+        return 0.0
+    dot = sum(count * b.get(token, 0) for token, count in a.items())
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
+    if not norm_a or not norm_b:
+        return 0.0
+    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
+
+
 def extract_skills(text: str) -> set:
-    text_lower = text.lower()
+    text_lower = (text or "").lower()
     found = set()
-
     for skill in COMMON_SKILLS:
-        pattern = (
-            r"(?<![a-zA-Z0-9])"
-            + re.escape(skill)
-            + r"(?![a-zA-Z0-9])"
-        )
-
+        pattern = r"(?<![a-zA-Z0-9])" + re.escape(skill) + r"(?![a-zA-Z0-9])"
         if re.search(pattern, text_lower):
             found.add(skill)
-
     return found
-
-
-def _encode(texts: list[str]):
-    """Generate normalized embeddings with minimal inference overhead."""
-    model = get_model()
-
-    with torch.inference_mode():
-        embeddings = model.encode(
-            texts,
-            batch_size=1,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-
-    return embeddings
-
-
-@lru_cache(maxsize=512)
-def _embed_one(text: str):
-    """
-    Embedding for one text, remembered in memory. Browsing jobs scores one resume
-    against every open job, so without this the same resume (and the same job
-    descriptions) would be re-embedded on every page load. Results are identical.
-    """
-    return _encode([text])[0]
 
 
 def combine_score(semantic: float, job_skills: set, resume_skills: set, must_have: set) -> float:
@@ -121,31 +85,13 @@ def combine_score(semantic: float, job_skills: set, resume_skills: set, must_hav
 
 
 def score_resume(job_description: str, resume_text: str, must_have=None) -> dict:
-    """
-    Score a single resume against a single job description.
-
-    must_have: optional list of skills HR marked as required for this job.
-
-    Returns:
-        {
-            "score": float,                 # final score (uses must-haves if given)
-            "semantic_score": float,        # meaning similarity only
-            "matched_skills": list[str],
-            "missing_skills": list[str],
-            "missing_must_have": list[str]  # required skills the resume lacks
-        }
-    """
-    # With normalized embeddings, cosine similarity equals dot product.
-    similarity = float(_embed_one(job_description) @ _embed_one(resume_text))
-    semantic = round(similarity * 100, 2)
-
+    """Score one resume using lightweight text similarity and skill coverage."""
+    semantic = round(_cosine_similarity(job_description, resume_text) * 100, 2)
     jd_skills = extract_skills(job_description)
     resume_skills = extract_skills(resume_text)
-
     matched = sorted(jd_skills & resume_skills)
     missing = sorted(jd_skills - resume_skills)
     must = set(must_have or []) & jd_skills
-
     return {
         "score": combine_score(semantic, jd_skills, resume_skills, must),
         "semantic_score": semantic,
@@ -155,36 +101,17 @@ def score_resume(job_description: str, resume_text: str, must_have=None) -> dict
     }
 
 
-def rank_resumes(
-    job_description: str,
-    resumes: list[dict],
-    must_have=None,
-) -> list[dict]:
-    """
-    Batch version (used by HR bulk screening).
-
-    resumes = [{"id": ..., "filename": ..., "text": ...}, ...]
-    must_have = optional list of required skills for the job
-
-    Returns resumes augmented with score / semantic_score / matched_skills /
-    missing_skills / missing_must_have, sorted by score descending.
-    """
+def rank_resumes(job_description: str, resumes: list[dict], must_have=None) -> list[dict]:
+    """Rank a batch of resumes without loading heavyweight ML libraries."""
     if not resumes:
         return []
-
-    jd_embedding = _embed_one(job_description)
-    resume_embeddings = _encode([r["text"] for r in resumes])
-
-    # Normalized vectors -> dot product = cosine similarity.
-    similarities = resume_embeddings @ jd_embedding
-
     jd_skills = extract_skills(job_description)
     must = set(must_have or []) & jd_skills
-
     results = []
-    for i, resume in enumerate(resumes):
-        resume_skills = extract_skills(resume["text"])
-        semantic = round(float(similarities[i]) * 100, 2)
+    for resume in resumes:
+        resume_text = resume.get("text", "") or ""
+        resume_skills = extract_skills(resume_text)
+        semantic = round(_cosine_similarity(job_description, resume_text) * 100, 2)
         results.append({
             **resume,
             "score": combine_score(semantic, jd_skills, resume_skills, must),
@@ -193,6 +120,5 @@ def rank_resumes(
             "missing_skills": sorted(jd_skills - resume_skills),
             "missing_must_have": sorted(must - resume_skills),
         })
-
-    results.sort(key=lambda r: r["score"], reverse=True)
+    results.sort(key=lambda item: item["score"], reverse=True)
     return results
